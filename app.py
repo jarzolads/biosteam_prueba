@@ -1,92 +1,137 @@
 import streamlit as st
 import biosteam as bst
 import thermosteam as tmo
-import google.generativeai as genai
 import pandas as pd
+import google.generativeai as genai
 
 # ==========================================
 # CONFIGURACIÓN DE GEMINI
 # ==========================================
-# Es recomendable usar st.secrets para la API Key en producción
-API_KEY = "TU_GEMINI_API_KEY" 
-genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+try:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    model = genai.GenerativeModel('gemini-1.5-flash')
+except:
+    st.warning("⚠️ No se encontró la API Key de Gemini en Secrets.")
 
 # ==========================================
 # INTERFAZ DE STREAMLIT
 # ==========================================
-st.set_page_config(page_title="BioSTEAM + Gemini AI", layout="wide")
+st.set_page_config(page_title="Simulador BioSTEAM", layout="wide")
+st.title("🧪 Planta de Etanol con Reciclo Energético")
 
-st.title("👨‍🏫 Simulador Educativo: Separación de Etanol")
-st.markdown("### Análisis de Sensibilidad con Inteligencia Artificial")
-
-# Sidebar para parámetros
+# --- SIDEBAR: PARÁMETROS DINÁMICOS ---
 with st.sidebar:
-    st.header("🔧 Parámetros de Proceso")
-    f_total = st.number_input("Flujo de alimentación (kg/h)", value=1000)
-    z_eth = st.slider("Fracción masa Etanol en entrada", 0.05, 0.15, 0.10)
-    t_flash = st.slider("Temperatura de Precalentamiento (°C)", 80, 98, 92)
-    p_flash = st.slider("Presión de Operación (atm)", 0.5, 1.5, 1.0)
+    st.header("⚙️ Parámetros de Control")
+    f_mass_total = st.slider("Flujo Alimentación (kg/h)", 500, 2000, 1000)
+    t_e100_out = st.slider("Temp. Salida E-100 (°C)", 70, 90, 85)
+    t_e101_out = st.slider("Temp. Salida E-101 (°C)", 85, 98, 92)
+    p_flash_atm = st.slider("Presión V-102 (atm)", 0.5, 1.5, 1.0)
     
     st.divider()
-    analyze_btn = st.button("🚀 Simular y Explicar con IA", type="primary")
+    btn_simular = st.button("🚀 Ejecutar Simulación e IA", type="primary")
 
 # ==========================================
-# LÓGICA DE BIOSTEAM (SIMPLIFICADA PARA EL FRONTEND)
+# LÓGICA DE SIMULACIÓN (TU CÓDIGO)
 # ==========================================
-def simular(f, z, t, p):
+def ejecutar_simulacion(f_total, t_e100, t_e101, p_atm):
+    # 1. SETUP
     chemicals = tmo.Chemicals(['Water', 'Ethanol'])
     bst.settings.set_thermo(chemicals)
     
-    # Definición rápida de sistema
-    feed = bst.Stream('feed', Water=f*(1-z), Ethanol=f*z, units='kg/hr', T=298.15)
-    F1 = bst.Flash('V102', ins=feed, outs=('vapor', 'liquido'), T=t+273.15, P=p*101325)
+    # 2. STREAMS
+    # Convertimos kg/h a kmol/h basándonos en tu lógica (10% peso ethanol)
+    # PM promedio aprox 20.82
+    f_kmol = f_total / 20.82
+    mosto = bst.Stream('1-MOSTO',
+                       Water=f_kmol*0.9, Ethanol=f_kmol*0.1, units='kmol/hr',
+                       T=25 + 273.15, P=101325)
+
+    vinazas_retorno = bst.Stream('VINAZAS-RETORNO',
+                                 Water=f_kmol*0.9, Ethanol=0, units='kmol/hr',
+                                 T=95 + 273.15, P=300000)
+
+    # 3. EQUIPOS
+    P100 = bst.Pump('P-100', ins=mosto, P=4 * 101325)
+    E100 = bst.HXprocess('E-100', ins=(P100-0, vinazas_retorno), 
+                         outs=('3-MOSTO-PRE', 'DRENAJE'), phase0='l', phase1='l')
+    E100.outs[0].T = t_e100 + 273.15
+
+    E101 = bst.HXutility('E-101', ins=E100-0, T=t_e101 + 273.15)
+    V100 = bst.IsenthalpicValve('V-100', ins=E101-0, outs='MEZCLA-BIFASICA', P=p_atm * 101325)
+    V102 = bst.Flash('V-102', ins=V100-0, outs=('VAPOR-CALIENTE', 'VINAZAS'), P=p_atm * 101325, Q=0)
+    E102 = bst.HXutility('E-102', ins=V102-0, outs='PRODUCTO-FINAL', T=25 + 273.15)
+    P101 = bst.Pump('P-101', ins=V102-1, outs=vinazas_retorno, P=3 * 101325)
+
+    # 4. SISTEMA
+    eth_sys = bst.System('planta_etanol', path=(P100, E100, E101, V100, V102, E102, P101))
+    eth_sys.simulate()
     
-    # Ejecutar
-    F1.simulate()
-    
-    # Resultados clave para la IA
-    pureza = F1.outs[0].imass['Ethanol'] / F1.outs[0].F_mass if F1.outs[0].F_mass > 0 else 0
-    recuperacion = F1.outs[0].imass['Ethanol'] / feed.imass['Ethanol']
-    energia = F1.duty / 3600 # kW
-    
-    return F1, pureza, recuperacion, energia
+    return eth_sys
 
 # ==========================================
-# EJECUCIÓN Y DESPLIEGUE
+# TU FUNCIÓN DE REPORTE (MODIFICADA PARA EVITAR EL ERROR)
 # ==========================================
-if analyze_btn:
-    # 1. Correr simulación
-    obj_flash, pur, rec, q = simular(f_total, z_eth, t_flash, p_flash)
+def generar_reporte_streamlit(sistema):
+    # TABLA MATERIA
+    datos_mat = []
+    for s in sistema.streams:
+        if s.F_mass > 0:
+            datos_mat.append({
+                'ID Corriente': s.ID,
+                'Temp (°C)': f"{s.T - 273.15:.2f}",
+                'Presión (bar)': f"{s.P/1e5:.2f}",
+                'Flujo (kg/h)': f"{s.F_mass:.1f}",
+                '% Etanol': f"{s.imass['Ethanol']/s.F_mass:.1%}" if s.F_mass > 0 else "0%"
+            })
     
-    # 2. Mostrar métricas rápidas
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Pureza de Etanol (V)", f"{pur:.1%}")
-    c2.metric("Recuperación", f"{rec:.1%}")
-    c3.metric("Energía Flash", f"{q:.2f} kW")
+    # TABLA ENERGÍA (Corrección de .duty)
+    datos_en = []
+    for u in sistema.units:
+        calor_kw = 0.0
+        # CORRECCIÓN: Usar Hnet o heat_utilities para evitar el AttributeError
+        if hasattr(u, 'heat_utilities') and u.heat_utilities:
+            calor_kw = sum(h.duty for h in u.heat_utilities) / 3600
+        elif isinstance(u, bst.HXprocess):
+            calor_kw = (u.outs[0].H - u.ins[0].H) / 3600
 
-    # 3. Prompt para Gemini
-    # Le damos contexto técnico para que actúe como profesor
-    contexto_ia = f"""
-    Actúa como un profesor de Ingeniería Química. 
-    Se ha simulado un tanque Flash de separación Etanol-Agua con estos datos:
-    - Alimentación: {f_total} kg/h con {z_eth:.1%} de etanol.
-    - Condiciones: {t_flash}°C y {p_flash} atm.
-    - Resultados: Pureza del {pur:.1%} en el vapor y {q:.2f} kW de carga térmica.
-    
-    Explica de forma concisa por qué estos parámetros dieron ese resultado 
-    y qué pasaría con la pureza si aumentamos la presión.
-    """
+        if abs(calor_kw) > 0.01:
+            datos_en.append({'Equipo': u.ID, 'Energía (kW)': round(calor_kw, 2)})
+            
+    return pd.DataFrame(datos_mat), pd.DataFrame(datos_en)
 
-    with st.expander("🤖 Análisis del Profesor Gemini", expanded=True):
-        with st.spinner("Gemini está analizando los balances..."):
-            response = model.generate_content(contexto_ia)
-            st.write(response.text)
-    
-    # 4. Mostrar Tablas de BioSTEAM
-    st.subheader("Datos Detallados de Corrientes")
-    df_streams = pd.DataFrame([
-        {"Corriente": "Vapor", "Flujo (kg/h)": obj_flash.outs[0].F_mass, "T (°C)": obj_flash.outs[0].T-273.15},
-        {"Corriente": "Líquido", "Flujo (kg/h)": obj_flash.outs[1].F_mass, "T (°C)": obj_flash.outs[1].T-273.15}
-    ])
-    st.dataframe(df_streams)
+# --- EJECUCIÓN ---
+if btn_simular:
+    with st.spinner("Simulando proceso..."):
+        sistema = ejecutar_simulacion(f_mass_total, t_e100_out, t_e101_out, p_flash_atm)
+        df_m, df_e = generar_reporte_streamlit(sistema)
+        
+        # Mostrar resultados
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Balance de Materia")
+            st.dataframe(df_m)
+        with col2:
+            st.subheader("Requerimientos Energéticos")
+            st.dataframe(df_e)
+
+        # --- EXPLICACIÓN IA ---
+        st.divider()
+        st.subheader("🤖 Análisis del Profesor Gemini")
+        
+        # Extraemos el dato clave de pureza para la IA
+        prod = sistema.flowsheet.stream.get('PRODUCTO-FINAL')
+        pureza = prod.imass['Ethanol'] / prod.F_mass if prod.F_mass > 0 else 0
+        
+        prompt = f"""
+        Como experto en ingeniería química, analiza estos resultados de BioSTEAM:
+        1. Temperatura de entrada al flash: {t_e101_out}°C.
+        2. Presión de operación: {p_flash_atm} atm.
+        3. Pureza de etanol obtenida: {pureza:.2%}.
+        Explica el impacto de mover estos parámetros en la eficiencia de separación.
+        """
+        
+        try:
+            response = model.generate_content(prompt)
+            st.info(response.text)
+        except:
+            st.error("No se pudo generar la explicación (Revisa la API Key).")
