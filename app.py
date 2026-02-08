@@ -8,7 +8,7 @@ import pandas as pd
 # CONFIGURACIÓN DE GEMINI
 # ==========================================
 # Es recomendable usar st.secrets para la API Key en producción
-API_KEY = "TU_GEMINI_API_KEY_AQUI" 
+API_KEY = "TU_GEMINI_API" 
 genai.configure(api_key=API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
